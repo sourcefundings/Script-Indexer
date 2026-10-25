@@ -2,10 +2,11 @@
     ScriptFinder v2 — Studio-style script browser, global search & editor
     Run in an executor with decompile()/getscriptbytecode() support.
 
-    Credits: sourcefundings and collabs with Claude
-
     Features
       • Explorer panel (grouped by service) / Find Results with per-line hits
+      • Name filter (Explorer) + "find in this script" filter (editor)
+      • Server-side scripts are excluded (ServerScriptService, ServerStorage,
+        and Script objects whose RunContext isn't Client)
       • Script tabs, syntax highlighting (Studio dark palette), search-term highlighting
       • Full scrollable + editable editor with line numbers, caret and Ln/Col
       • Drag, resize (bottom-right grip), maximize (button or double-click title),
@@ -36,7 +37,7 @@ local TOP, RIBBON, STATUS = 28, 34, 22
 local GUT_W  = 56
 local MINW, MINH = 560, 320
 
--- theme
+-- ================= THEME (Studio dark) =================
 local C = {
     window   = Color3.fromRGB(46, 46, 46),
     titlebar = Color3.fromRGB(37, 37, 37),
@@ -65,7 +66,7 @@ local SYN = {
 }
 local MARK_OPEN, MARK_CLOSE = '<mark color="#8A7000" transparency="0.2">', '</mark>'
 
--- helpers
+-- ================= HELPERS =================
 local conns = {}
 local function bind(signal, fn)
     local c = signal:Connect(fn)
@@ -117,18 +118,44 @@ local function esc(s)
     return (string.gsub(s, "[&<>\"']", ESC))
 end
 
-local ICON_INDEX = { Script = 6, LocalScript = 18, ModuleScript = 76, Folder = 77 }
+-- icons are drawn from plain Frames, so they never depend on a sprite sheet
+local ICONS = {
+    LocalScript  = { color = Color3.fromRGB(0, 162, 255),   letter = "L" },
+    ModuleScript = { color = Color3.fromRGB(170, 110, 230), letter = "M" },
+    Script       = { color = Color3.fromRGB(80, 190, 110),  letter = "S" },
+}
 local function classIcon(class, parent, x, y)
-    return new("ImageLabel", {
-        Image = "rbxasset://textures/ClassImages.png",
-        ImageRectSize = Vector2.new(16, 16),
-        ImageRectOffset = Vector2.new((ICON_INDEX[class] or 6) * 16, 0),
+    local holder = new("Frame", {
         Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(x, y),
         BackgroundTransparency = 1, Parent = parent,
     })
+    if class == "Folder" then
+        local tab = new("Frame", {
+            Position = UDim2.fromOffset(1, 2), Size = UDim2.fromOffset(7, 4),
+            BackgroundColor3 = Color3.fromRGB(196, 158, 70), BorderSizePixel = 0, Parent = holder,
+        })
+        new("UICorner", { CornerRadius = UDim.new(0, 1), Parent = tab })
+        local bodyF = new("Frame", {
+            Position = UDim2.fromOffset(1, 4), Size = UDim2.fromOffset(14, 10),
+            BackgroundColor3 = Color3.fromRGB(230, 190, 95), BorderSizePixel = 0, Parent = holder,
+        })
+        new("UICorner", { CornerRadius = UDim.new(0, 2), Parent = bodyF })
+        return holder
+    end
+    local spec = ICONS[class] or ICONS.Script
+    local page = new("Frame", {
+        Position = UDim2.fromOffset(2, 1), Size = UDim2.fromOffset(12, 14),
+        BackgroundColor3 = spec.color, BorderSizePixel = 0, Parent = holder,
+    })
+    new("UICorner", { CornerRadius = UDim.new(0, 2), Parent = page })
+    new("TextLabel", {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = spec.letter,
+        Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = Color3.new(1, 1, 1), Parent = page,
+    })
+    return holder
 end
 
--- main ui
+-- ================= ROOT GUI =================
 local parentGui = (gethui and gethui()) or player:WaitForChild("PlayerGui")
 local old = parentGui:FindFirstChild("ScriptFinder")
 if old then old:Destroy() end
@@ -138,6 +165,7 @@ local gui = new("ScreenGui", {
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 50, Parent = parentGui,
 })
 
+-- measure the monospace font so the editable box and the highlight layer line up
 local charW, lineH
 do
     local probe = label({
@@ -157,7 +185,7 @@ do
     if not lineH or lineH <= 0 then lineH = CODE_SIZE end
 end
 
--- lexer/highlighter
+-- ================= LEXER / HIGHLIGHTER =================
 local KEYWORDS, BUILTINS = {}, {}
 for w in ("and break do else elseif end for function if in local not or repeat return then until while continue"):gmatch("%S+") do
     KEYWORDS[w] = true
@@ -348,7 +376,7 @@ local function lineCol(text, index)
     return line, (utf8.len(colStr) or #colStr)
 end
 
--- window
+-- ================= WINDOW =================
 local vp = workspace.CurrentCamera.ViewportSize
 local main = new("Frame", {
     Size = UDim2.fromOffset(920, 580),
@@ -403,26 +431,32 @@ local ribbon = new("Frame", {
 })
 new("Frame", { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = C.border, BorderSizePixel = 0, Parent = ribbon })
 
-local searchBox = new("TextBox", {
-    Position = UDim2.fromOffset(8, 5), Size = UDim2.fromOffset(340, 24),
-    BackgroundColor3 = C.input, BorderSizePixel = 0, ClearTextOnFocus = false, Text = "",
-    PlaceholderText = "Find in all scripts…", PlaceholderColor3 = Color3.fromRGB(110, 110, 110),
-    Font = UI_FONT, TextSize = 15, TextColor3 = C.text,
-    TextXAlignment = Enum.TextXAlignment.Left, ClipsDescendants = true, Parent = ribbon,
-})
-local searchStroke = stroke(searchBox, C.border)
-new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = searchBox })
-searchBox.Focused:Connect(function() searchStroke.Color = C.accent end)
-searchBox.FocusLost:Connect(function() searchStroke.Color = C.border end)
+local function inputBox(placeholder, pos, size, parent, textSize)
+    local box = new("TextBox", {
+        Position = pos, Size = size,
+        BackgroundColor3 = C.input, BorderSizePixel = 0, ClearTextOnFocus = false, Text = "",
+        PlaceholderText = placeholder, PlaceholderColor3 = Color3.fromRGB(110, 110, 110),
+        Font = UI_FONT, TextSize = textSize or 15, TextColor3 = C.text,
+        TextXAlignment = Enum.TextXAlignment.Left, ClipsDescendants = true, Parent = parent,
+    })
+    local st = stroke(box, C.border)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = box })
+    box.Focused:Connect(function() st.Color = C.accent end)
+    box.FocusLost:Connect(function() st.Color = C.border end)
+    return box
+end
 
-local caseBtn    = toolButton("Aa", UDim2.fromOffset(30, 24), UDim2.fromOffset(354, 5), ribbon)
-local reindexBtn = toolButton("Re-index  (F5)", UDim2.fromOffset(104, 24), UDim2.fromOffset(390, 5), ribbon)
+local searchBox  = inputBox("Find in all scripts…", UDim2.fromOffset(8, 5), UDim2.fromOffset(280, 24), ribbon)
+local caseBtn    = toolButton("Aa", UDim2.fromOffset(30, 24), UDim2.fromOffset(294, 5), ribbon)
+local nameBox    = inputBox("Filter by script name…", UDim2.fromOffset(334, 5), UDim2.fromOffset(190, 24), ribbon)
+local reindexBtn = toolButton("Re-index  (F5)", UDim2.fromOffset(104, 24), UDim2.fromOffset(530, 5), ribbon)
 local hint = label({
     Text = "Ctrl+Shift+F toggle  ·  F3 next match  ·  Ctrl+S save", TextColor3 = C.dim, TextSize = 13,
     TextXAlignment = Enum.TextXAlignment.Right, AnchorPoint = Vector2.new(1, 0),
     Position = UDim2.new(1, -10, 0, 0), Size = UDim2.new(0, 320, 1, 0), Parent = ribbon,
 })
 
+-- left panel (Explorer / Find Results)
 local bodyY = TOP + RIBBON
 local leftW = 270
 local leftPanel = new("Frame", { BackgroundColor3 = C.panel, BorderSizePixel = 0, Parent = main })
@@ -460,8 +494,9 @@ local findBar = new("Frame", {
 new("Frame", { Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = C.border, BorderSizePixel = 0, Parent = findBar })
 local prevBtn = toolButton("<", UDim2.fromOffset(22, 20), UDim2.fromOffset(6, 4), findBar)
 local nextBtn = toolButton(">", UDim2.fromOffset(22, 20), UDim2.fromOffset(32, 4), findBar)
+local localBox = inputBox("Find in this script…", UDim2.fromOffset(60, 4), UDim2.fromOffset(170, 20), findBar, 14)
 local findInfo = label({
-    Position = UDim2.fromOffset(62, 0), Size = UDim2.new(1, -330, 1, 0), TextColor3 = C.dim,
+    Position = UDim2.fromOffset(238, 0), Size = UDim2.new(1, -(238 + 270), 1, 0), TextColor3 = C.dim,
     TextSize = 13, TextTruncate = Enum.TextTruncate.AtEnd, Parent = findBar,
 })
 local roTag = label({
@@ -492,6 +527,7 @@ local scroll = new("ScrollingFrame", {
 })
 local content = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(), Parent = scroll })
 
+-- the real TextBox sits underneath with invisible text; the highlight layer draws on top
 local editBox = new("TextBox", {
     Position = UDim2.fromOffset(PAD, PAD), BackgroundTransparency = 1, TextColor3 = C.editor,
     Font = CODE_FONT, TextSize = CODE_SIZE, MultiLine = true, ClearTextOnFocus = false,
@@ -513,6 +549,7 @@ local emptyLabel = label({
     Size = UDim2.new(1, 0, 1, -26), Parent = editorArea,
 })
 
+-- status bar + resize grip
 local statusBar = new("Frame", {
     AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1, 0, 0, STATUS),
     BackgroundColor3 = C.header, BorderSizePixel = 0, Parent = main,
@@ -543,18 +580,20 @@ local function applyLayout()
     leftPanel.Position  = UDim2.fromOffset(0, bodyY);         leftPanel.Size  = UDim2.new(0, leftW, 1, h)
     splitter.Position   = UDim2.fromOffset(leftW, bodyY);     splitter.Size   = UDim2.new(0, 4, 1, h)
     editorArea.Position = UDim2.fromOffset(leftW + 4, bodyY); editorArea.Size = UDim2.new(1, -(leftW + 4), 1, h)
-    hint.Visible = w >= 880
+    hint.Visible = w >= 1000
 end
 main:GetPropertyChangedSignal("AbsoluteSize"):Connect(applyLayout)
 applyLayout()
 
--- editor
-local sources = {}
+-- ================= EDITOR STATE =================
+local sources = {}          -- { {obj, path, service, parentPath, name, class, source, lower, draft} }
 local tabs, activeTab = {}, nil
-local searchTerm = ""
+local searchTerm = ""       -- global search (all scripts)
+local localTerm = ""        -- find inside the open script (overrides global highlight)
+local function editorTerm() return localTerm ~= "" and localTerm or searchTerm end
 local chunkLabels = {}
 local contentW, contentH = 0, 0
-local switchTab, closeTab
+local switchTab, closeTab   -- forward declarations
 
 scroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
     gutterInner.Position = UDim2.fromOffset(0, -scroll.CanvasPosition.Y)
@@ -586,12 +625,13 @@ end
 local function updateFindBar()
     local tab = activeTab
     if not tab then return end
-    if searchTerm == "" then
+    local term = editorTerm()
+    if term == "" then
         findInfo.Text = tab.entry.path
     else
         local n = #tab.matches
-        findInfo.Text = n == 0 and ('No matches for "%s"'):format(searchTerm)
-            or ('"%s"    %d of %d%s'):format(searchTerm, tab.matchIdx, n, n >= 5000 and "+" or "")
+        findInfo.Text = n == 0 and ('No matches for "%s"'):format(term)
+            or ('"%s"   %d of %d%s'):format(term, tab.matchIdx, n, n >= 5000 and "+" or "")
     end
 end
 
@@ -607,7 +647,7 @@ local function renderActive(keepScroll)
 
     local src = tab.text
     local prevScroll = scroll.CanvasPosition
-    tab.matches = findAll(src, searchTerm)
+    tab.matches = findAll(src, editorTerm())
     local lines = buildLines(src, tab.matches)
     local n = #lines
 
@@ -672,6 +712,7 @@ local function gotoMatch(idx)
     updateFindBar()
 end
 
+-- tabs
 local tabButtons = {}
 local function refreshTabs()
     for _, b in ipairs(tabButtons) do b:Destroy() end
@@ -717,7 +758,7 @@ end
 function closeTab(tab)
     local i = table.find(tabs, tab)
     if not i then return end
-    if tab.dirty then tab.entry.draft = tab.text end
+    if tab.dirty then tab.entry.draft = tab.text end   -- unsaved edits survive reopening
     table.remove(tabs, i)
     if activeTab == tab then
         activeTab = tabs[i] or tabs[i - 1]
@@ -737,10 +778,33 @@ local function openEntry(entry, matchIdx)
         tab = { entry = entry, text = entry.draft or entry.source, dirty = entry.draft ~= nil, matchIdx = 0, matches = {} }
         table.insert(tabs, tab)
     end
+    -- jumping to a global search hit clears the in-script filter so the index lines up
+    if matchIdx and localTerm ~= "" then
+        localTerm = ""
+        localBox.Text = ""
+    end
     switchTab(tab)
-    if searchTerm ~= "" and #tab.matches > 0 then gotoMatch(matchIdx or 1) end
+    if editorTerm() ~= "" and #tab.matches > 0 then gotoMatch(matchIdx or 1) end
 end
 
+local localSerial = 0
+localBox:GetPropertyChangedSignal("Text"):Connect(function()
+    localSerial += 1
+    local my = localSerial
+    task.delay(0.15, function()
+        if my ~= localSerial or localBox.Text == localTerm then return end
+        localTerm = localBox.Text
+        if activeTab then
+            renderActive(true)
+            if #activeTab.matches > 0 then gotoMatch(1) end
+        end
+    end)
+end)
+localBox.FocusLost:Connect(function(enter)
+    if enter and activeTab then gotoMatch(activeTab.matchIdx + 1) end
+end)
+
+-- caret, Ln/Col, keep caret visible while typing
 local blinkT = 0
 local function updateCaret(ensureVisible)
     local cur = editBox.CursorPosition
@@ -768,6 +832,7 @@ bind(RunService.Heartbeat, function(dt)
     end
 end)
 
+-- live editing: small scripts re-highlight instantly, big ones after a pause
 local editSerial = 0
 editBox:GetPropertyChangedSignal("Text"):Connect(function()
     local tab = activeTab
@@ -783,6 +848,7 @@ editBox:GetPropertyChangedSignal("Text"):Connect(function()
     end)
 end)
 
+-- save / copy / revert
 local function saveActive()
     local tab = activeTab
     if not tab then return end
@@ -833,6 +899,7 @@ revertBtn.MouseButton1Click:Connect(revertActive)
 prevBtn.MouseButton1Click:Connect(function() if activeTab then gotoMatch(activeTab.matchIdx - 1) end end)
 nextBtn.MouseButton1Click:Connect(function() if activeTab then gotoMatch(activeTab.matchIdx + 1) end end)
 
+-- ================= EXPLORER / FIND RESULTS =================
 local listRows, selectedRow = {}, nil
 
 local function makeRow(height, order)
@@ -875,12 +942,18 @@ local function runSearch()
 
     local term = searchTerm
     local order, rows = 0, 0
+    local nameFilter = string.lower(nameBox.Text)
+    local function nameOk(entry)
+        return nameFilter == "" or string.find(string.lower(entry.path), nameFilter, 1, true) ~= nil
+    end
 
     if term == "" then
-        leftTitle.Text = ("Explorer  ·  %d scripts"):format(#sources)
+        local shown = 0
         local lastService
         for _, entry in ipairs(sources) do
             if rows >= MAX_RESULT_ROWS then break end
+            if not nameOk(entry) then continue end
+            shown += 1
             if entry.service ~= lastService then
                 lastService = entry.service
                 order += 1
@@ -898,6 +971,8 @@ local function runSearch()
             })
             r.MouseButton1Click:Connect(function() selectRow(r); openEntry(entry) end)
         end
+        leftTitle.Text = nameFilter == "" and ("Explorer  ·  %d scripts"):format(#sources)
+            or ("Explorer  ·  %d of %d scripts"):format(shown, #sources)
         setStatus(("%d scripts indexed"):format(#sources))
         return
     end
@@ -906,6 +981,7 @@ local function runSearch()
     local totalHits, scriptsHit = 0, 0
     for _, entry in ipairs(sources) do
         if rows >= MAX_RESULT_ROWS then break end
+        if not nameOk(entry) then continue end
         local hay = matchCase and entry.source or entry.lower
         local nameHay = matchCase and entry.path or string.lower(entry.path)
         local s = string.find(hay, needle, 1, true)
@@ -976,6 +1052,14 @@ searchBox:GetPropertyChangedSignal("Text"):Connect(onSearchChanged)
 searchBox.FocusLost:Connect(function(enter)
     if enter and activeTab then gotoMatch(activeTab.matchIdx + 1) end
 end)
+local nameSerial = 0
+nameBox:GetPropertyChangedSignal("Text"):Connect(function()
+    nameSerial += 1
+    local my = nameSerial
+    task.delay(0.15, function()
+        if my == nameSerial then runSearch() end
+    end)
+end)
 caseBtn.MouseButton1Click:Connect(function()
     matchCase = not matchCase
     caseBtn:SetAttribute("on", matchCase)
@@ -983,6 +1067,7 @@ caseBtn.MouseButton1Click:Connect(function()
     onSearchChanged()
 end)
 
+-- ================= INDEXING =================
 local function getScriptSource(obj)
     local ok, src = pcall(function() return obj.Source end)
     if ok and src and #src > 0 then return src end
@@ -1005,6 +1090,21 @@ local CORE_ROOTS = { "CoreGui", "CorePackages", "RobloxScript", "PlayerModule" }
 if not INCLUDE_PLAYER_SCRIPTS then table.insert(CORE_ROOTS, "PlayerScripts") end
 local CORE_CLASSES = { CoreScript = true, CoreScriptContainer = true, RobloxScript = true, RobloxLocalScript = true }
 
+-- server-side code is never shown
+local SERVER_ROOTS = { ServerScriptService = true, ServerStorage = true }
+local function isServerSide(obj)
+    if obj.ClassName == "Script" then
+        local ok, rc = pcall(function() return obj.RunContext end)
+        if not (ok and rc == Enum.RunContext.Client) then return true end
+    end
+    local cur = obj.Parent
+    while cur and cur ~= game do
+        if SERVER_ROOTS[cur.ClassName] then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+
 local function isCore(obj)
     if CORE_CLASSES[obj.ClassName] then return true end
     local cur = obj
@@ -1025,7 +1125,7 @@ local function indexGame()
     local fresh = {}
     for i, obj in ipairs(game:GetDescendants()) do
         local okClass, isScript = pcall(function() return obj:IsA("LuaSourceContainer") end)
-        if okClass and isScript and not isCore(obj) then
+        if okClass and isScript and not isCore(obj) and not isServerSide(obj) then
             local src = getScriptSource(obj)
             if src then
                 src = (string.gsub(string.gsub(src, "\r\n", "\n"), "\t", "    "))
@@ -1056,6 +1156,7 @@ local function indexGame()
 end
 reindexBtn.MouseButton1Click:Connect(function() task.spawn(indexGame) end)
 
+-- ================= DRAG / RESIZE / WINDOW STATE =================
 local function makeDrag(handle, onStart, onMove)
     handle.InputBegan:Connect(function(input)
         if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
@@ -1149,6 +1250,7 @@ closeBtn.MouseButton1Click:Connect(function()
     gui:Destroy()
 end)
 
+-- ================= HOTKEYS =================
 bind(UserInputService.InputBegan, function(input, gp)
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
     local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
@@ -1166,5 +1268,6 @@ bind(UserInputService.InputBegan, function(input, gp)
     end
 end)
 
+-- ================= START =================
 renderActive(false)
 task.spawn(indexGame)
