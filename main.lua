@@ -397,7 +397,7 @@ local titleText = label({
     Size = UDim2.new(1, -140, 1, 0), Parent = titleBar,
 })
 local function setTitleCount(n)
-    titleText.Text = ('Script Finder  <font color="#8C8C8C">·  %d scripts indexed</font>'):format(n)
+    titleText.Text = ('Script Indexer  <font color="#8C8C8C">·  %d scripts indexed</font>'):format(n)
 end
 setTitleCount(0)
 
