@@ -1,6 +1,7 @@
 --[[
     ScriptFinder v2 — Studio-style script browser, global search & editor
     Run in an executor with decompile()/getscriptbytecode() support.
+    Made in collaboration with Claude
 
     Features
       • Explorer panel (grouped by service) / Find Results with per-line hits
